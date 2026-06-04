@@ -1,0 +1,1205 @@
+//! `shuma-remote-exec` — cliente **sync** del subprotocolo
+//! [`ExecStream`](shuma_protocol::Request::ExecStream) del daemon.
+//!
+//! El shell GPUI no es async; ejecuta comandos a través de
+//! `shuma-exec` (un crate puramente sync con threads + mpsc) y drena
+//! los eventos con `try_events()`. Este crate provee la misma forma —
+//! [`RemoteRunHandle`] paralelo a [`shuma_exec::RunHandle`] — pero los
+//! eventos vienen del **daemon** por Unix socket, no del proceso local.
+//!
+//! Eso permite que el shell sea cliente delgado contra `shuma-daemon`:
+//! una vez que el transporte abstrae la conexión, sustituir el Unix
+//! socket por una conexión autenticada (Bloque 7) o un túnel SSH es un
+//! cambio de implementación, no de API.
+//!
+//! Arquitectura interna:
+//!
+//! ```text
+//!   shell (sync) ──┐
+//!                  ├─ try_events / kill / is_finished (idéntico a shuma-exec)
+//!  RemoteRunHandle ┤
+//!                  └─ background thread: tokio runtime ─ UnixStream ─ daemon
+//! ```
+//!
+//! Un único hilo dedicado abre su propio runtime de tokio y conecta al
+//! socket; lee frames y los reemite como `RunEvent`s por un canal
+//! mpsc estándar. `kill()` cierra el stream — el daemon detecta el
+//! EOF y mata al proceso hijo (convención SSH/PTY).
+
+#![forbid(unsafe_code)]
+
+pub use shuma_exec::RunEvent;
+use shuma_exec::{CommandSpec, Exec};
+use shuma_protocol::{
+    read_frame, write_frame, ExecKind, ExecStage, Request, Response,
+};
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+/// Asa de un comando que se ejecuta en el daemon. API a propósito
+/// idéntica (en spirit) a [`shuma_exec::RunHandle`] para que el shell
+/// pueda usar ambos detrás del mismo trait.
+pub struct RemoteRunHandle {
+    rx: Receiver<RunEvent>,
+    finished: bool,
+    /// Señalización al hilo de fondo para cancelar (cerrar el stream).
+    /// El daemon detecta el EOF y mata al proceso.
+    cancel: Arc<Notify>,
+    /// Canal de salida cliente→daemon para sesiones **PTY** — lleva
+    /// `PtyInput`/`PtyResize`. `None` en runs no-PTY (`run`/`run_tcp`),
+    /// donde `write_input`/`resize` son no-op igual que en local.
+    pty_out: Option<tokio::sync::mpsc::UnboundedSender<Request>>,
+}
+
+impl RemoteRunHandle {
+    /// Mata el proceso remoto cerrando el stream — el daemon lo detecta
+    /// y dispara SIGKILL en el proceso hijo.
+    pub fn kill(&self) {
+        self.cancel.notify_waiters();
+    }
+
+    /// Envía bytes de stdin al PTY remoto. `false` si no es una sesión
+    /// PTY o el hilo de fondo ya cerró.
+    pub fn write_input(&self, bytes: Vec<u8>) -> bool {
+        match &self.pty_out {
+            Some(tx) => tx.send(Request::PtyInput { bytes }).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Reescala el PTY remoto. `false` fuera de una sesión PTY.
+    pub fn resize(&self, rows: u16, cols: u16) -> bool {
+        match &self.pty_out {
+            Some(tx) => tx.send(Request::PtyResize { rows, cols }).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drena eventos disponibles ahora, sin bloquear.
+    pub fn try_events(&mut self) -> Vec<RunEvent> {
+        let mut out = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok(ev) => {
+                    if matches!(ev, RunEvent::Exited(_) | RunEvent::Failed(_)) {
+                        self.finished = true;
+                    }
+                    out.push(ev);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.finished = true;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Bloquea hasta el próximo evento. `None` cuando terminó.
+    pub fn next_event(&mut self) -> Option<RunEvent> {
+        if self.finished {
+            return None;
+        }
+        match self.rx.recv() {
+            Ok(ev) => {
+                if matches!(ev, RunEvent::Exited(_) | RunEvent::Failed(_)) {
+                    self.finished = true;
+                }
+                Some(ev)
+            }
+            Err(_) => {
+                self.finished = true;
+                None
+            }
+        }
+    }
+
+    /// `true` si el evento terminal ya pasó.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// Errores que el shell puede ver al pedir un run remoto. La política
+/// es no-cae-el-shell: si el daemon no contesta, el caller traduce el
+/// error a un `RunEvent::Failed` y continúa.
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteExecError {
+    #[error("conexión Unix a {0}: {1}")]
+    Connect(PathBuf, std::io::Error),
+    #[error("conexión TCP a {0}: {1}")]
+    ConnectTcp(String, std::io::Error),
+    #[error("PTY remoto aún no soportado — usá el modo local para comandos TUI (vim, htop, etc.)")]
+    PtyNotSupported,
+}
+
+/// Lanza `spec` contra el daemon en `socket` y devuelve un asa cuyos
+/// eventos llegan en streaming. La función vuelve de inmediato — el
+/// trabajo de I/O se hace en un hilo aparte con su propio runtime.
+pub fn run(spec: &CommandSpec, socket: &std::path::Path) -> Result<RemoteRunHandle, RemoteExecError> {
+    let (tx, rx) = std::sync::mpsc::channel::<RunEvent>();
+    let cancel = Arc::new(Notify::new());
+    let cancel_thread = cancel.clone();
+    let socket_owned = socket.to_path_buf();
+
+    // Traducción a tipos del protocolo (los del crate `shuma-protocol`
+    // son los Serialize; los de `shuma-exec` son los locales).
+    // PTY remoto no está soportado aún — `ExecStream` es unidireccional
+    // (cliente→server: una Request, server→cliente: N events). Para PTY
+    // remoto haría falta un canal stdin server-bound (frame Input{bytes})
+    // y resize, en un protocolo distinto. Por ahora se rechaza upfront
+    // para que el shell pueda fallback a local con un mensaje útil.
+    let exec_proto = match &spec.exec {
+        Exec::Shell { line, program } => ExecKind::Shell {
+            line: line.clone(),
+            program: program.clone(),
+        },
+        Exec::Direct { stages } => ExecKind::Direct {
+            stages: stages
+                .iter()
+                .map(|s| ExecStage { program: s.program.clone(), args: s.args.clone() })
+                .collect(),
+        },
+        Exec::Pty { .. } => {
+            return Err(RemoteExecError::PtyNotSupported);
+        }
+    };
+    let req = Request::ExecStream {
+        cwd: spec.cwd.clone(),
+        exec: exec_proto,
+        capture_limit_bytes: spec.capture_limit,
+        stdin_data: spec.stdin_data.clone(),
+        capture_stages: spec.capture_stages,
+    };
+
+    // Conexión sincronicamente: si falla, devolvemos antes de spawnear
+    // el hilo. Así el caller decide qué hacer.
+    let std_stream = std::os::unix::net::UnixStream::connect(&socket_owned)
+        .map_err(|e| RemoteExecError::Connect(socket_owned.clone(), e))?;
+    std_stream
+        .set_nonblocking(true)
+        .map_err(|e| RemoteExecError::Connect(socket_owned.clone(), e))?;
+
+    std::thread::spawn(move || {
+        // Cada hilo de un comando trae su propio runtime current-thread —
+        // bajo en overhead, y el shell puede tener varios en vuelo sin
+        // contender un runtime global.
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(RunEvent::Failed(format!("runtime: {e}")));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let mut stream = match tokio::net::UnixStream::from_std(std_stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(RunEvent::Failed(format!("from_std: {e}")));
+                    return;
+                }
+            };
+            if let Err(e) = write_frame(&mut stream, &req).await {
+                let _ = tx.send(RunEvent::Failed(format!("write request: {e}")));
+                return;
+            }
+            // Loop: leer frames del daemon, traducirlos a RunEvent y
+            // reemitirlos. Si el cliente cancela, cerramos el stream y
+            // el daemon mata al hijo.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_thread.notified() => {
+                        // Cerrar — el daemon detectará EOF.
+                        drop(stream);
+                        return;
+                    }
+                    res = read_frame::<Response, _>(&mut stream) => {
+                        let resp = match res {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = tx.send(RunEvent::Failed(format!("read frame: {e}")));
+                                return;
+                            }
+                        };
+                        let terminal = resp.is_exec_terminal();
+                        if let Some(ev) = response_to_event(resp) {
+                            if tx.send(ev).is_err() {
+                                // El consumidor desapareció: cerrar para
+                                // que el daemon mate al hijo.
+                                return;
+                            }
+                        }
+                        if terminal {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    Ok(RemoteRunHandle { rx, finished: false, cancel, pty_out: None })
+}
+
+fn response_to_event(r: Response) -> Option<RunEvent> {
+    match r {
+        Response::ExecStarted { .. } => None, // metadato, no es un RunEvent
+        Response::ExecStdout(l) => Some(RunEvent::Stdout(l)),
+        Response::ExecStageStdout { stage, line } => {
+            Some(RunEvent::StageStdout { stage, line })
+        }
+        Response::ExecBytes(b) => Some(RunEvent::Bytes(b)),
+        Response::ExecStderr(l) => Some(RunEvent::Stderr(l)),
+        Response::ExecTruncated => Some(RunEvent::Truncated),
+        Response::ExecSpilled(p) => Some(RunEvent::Spilled(p)),
+        Response::ExecExited(c) => Some(RunEvent::Exited(c)),
+        Response::ExecFailed(m) => Some(RunEvent::Failed(m)),
+        other => Some(RunEvent::Failed(format!(
+            "frame inesperado en stream: {other:?}"
+        ))),
+    }
+}
+
+/// Convenience: usa la ruta canónica del socket que defina
+/// [`shuma_protocol::default_socket_path`].
+pub fn run_default(spec: &CommandSpec) -> Result<RemoteRunHandle, RemoteExecError> {
+    run(spec, &shuma_protocol::default_socket_path())
+}
+
+/// Extrae `(program, args, rows, cols)` de un spec PTY; `None` si el spec
+/// no es `Exec::Pty`.
+fn pty_fields(spec: &CommandSpec) -> Option<(String, Vec<String>, u16, u16)> {
+    match &spec.exec {
+        Exec::Pty { program, args, rows, cols } => {
+            Some((program.clone(), args.clone(), *rows, *cols))
+        }
+        _ => None,
+    }
+}
+
+/// Abre un **PTY remoto** sobre el socket Unix del daemon. A diferencia de
+/// [`run`], la conexión es full-duplex: el asa devuelta acepta
+/// `write_input`/`resize` (teclas y resize → daemon) mientras drena
+/// `RunEvent::Bytes` (la salida del terminal). El spec debe ser
+/// `Exec::Pty`; si no, devuelve [`RemoteExecError::PtyNotSupported`].
+pub fn run_pty(
+    spec: &CommandSpec,
+    socket: &std::path::Path,
+) -> Result<RemoteRunHandle, RemoteExecError> {
+    let Some((program, args, rows, cols)) = pty_fields(spec) else {
+        return Err(RemoteExecError::PtyNotSupported);
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<RunEvent>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
+    let cancel = Arc::new(Notify::new());
+    let cancel_thread = cancel.clone();
+    let socket_owned = socket.to_path_buf();
+    let req = Request::ExecPty { cwd: spec.cwd.clone(), program, args, rows, cols };
+
+    let std_stream = std::os::unix::net::UnixStream::connect(&socket_owned)
+        .map_err(|e| RemoteExecError::Connect(socket_owned.clone(), e))?;
+    std_stream
+        .set_nonblocking(true)
+        .map_err(|e| RemoteExecError::Connect(socket_owned.clone(), e))?;
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(RunEvent::Failed(format!("runtime: {e}")));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let stream = match tokio::net::UnixStream::from_std(std_stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(RunEvent::Failed(format!("from_std: {e}")));
+                    return;
+                }
+            };
+            let (mut rd, mut wr) = tokio::io::split(stream);
+            // Mandamos la apertura del PTY por la mitad de escritura.
+            if let Err(e) = write_frame(&mut wr, &req).await {
+                let _ = tx.send(RunEvent::Failed(format!("write request: {e}")));
+                return;
+            }
+            // Tarea escritora: drena teclas/resizes del shell → daemon.
+            let writer = tokio::spawn(async move {
+                while let Some(msg) = out_rx.recv().await {
+                    if write_frame(&mut wr, &msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            // Loop lector: salida del PTY → RunEvent, hasta terminal/cancel.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_thread.notified() => break,
+                    res = read_frame::<Response, _>(&mut rd) => {
+                        let resp = match res {
+                            Ok(r) => r,
+                            Err(_) => break, // EOF/error: el daemon cerró
+                        };
+                        let terminal = resp.is_exec_terminal();
+                        if let Some(ev) = response_to_event(resp) {
+                            if tx.send(ev).is_err() {
+                                break;
+                            }
+                        }
+                        if terminal {
+                            break;
+                        }
+                    }
+                }
+            }
+            writer.abort();
+            // Al dropear `rd`/`wr` se cierra el stream → el daemon mata el PTY.
+        });
+    });
+
+    Ok(RemoteRunHandle { rx, finished: false, cancel, pty_out: Some(out_tx) })
+}
+
+/// Variante autenticada y cifrada vía Noise XK sobre TCP — espejo de
+/// [`run`] para hablar con un daemon **remoto**. El cliente conoce de
+/// antemano la pubkey del servidor (`server_pub`, igual que
+/// `known_hosts` en SSH); el server valida nuestra pubkey contra su
+/// propio allowlist.
+///
+/// El `RemoteRunHandle` que devuelve tiene la misma forma que el del
+/// Unix path — el shell consume `try_events / kill / is_finished`
+/// igual en los dos casos.
+pub fn run_tcp(
+    spec: &CommandSpec,
+    addr: &str,
+    our_keypair: shuma_link::Keypair,
+    server_pub: shuma_link::PublicKey,
+) -> Result<RemoteRunHandle, RemoteExecError> {
+    let (tx, rx) = std::sync::mpsc::channel::<RunEvent>();
+    let cancel = Arc::new(Notify::new());
+    let cancel_thread = cancel.clone();
+    let addr_owned = addr.to_string();
+
+    // Mismo proto Request que el path Unix.
+    let exec_proto = match &spec.exec {
+        Exec::Shell { line, program } => ExecKind::Shell {
+            line: line.clone(),
+            program: program.clone(),
+        },
+        Exec::Direct { stages } => ExecKind::Direct {
+            stages: stages
+                .iter()
+                .map(|s| ExecStage { program: s.program.clone(), args: s.args.clone() })
+                .collect(),
+        },
+        Exec::Pty { .. } => {
+            return Err(RemoteExecError::PtyNotSupported);
+        }
+    };
+    let req = Request::ExecStream {
+        cwd: spec.cwd.clone(),
+        exec: exec_proto,
+        capture_limit_bytes: spec.capture_limit,
+        stdin_data: spec.stdin_data.clone(),
+        capture_stages: spec.capture_stages,
+    };
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(RunEvent::Failed(format!("runtime: {e}")));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            // 1) Conexión TCP. El error de conexión llega como Failed
+            // (en vez de Err(RemoteExecError::ConnectTcp)) porque el
+            // caller ya recibió el RemoteRunHandle: la forma de
+            // notificarle ahora es vía el canal de eventos.
+            let tcp = match tokio::net::TcpStream::connect(&addr_owned).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(RunEvent::Failed(format!("connect {addr_owned}: {e}")));
+                    return;
+                }
+            };
+            // 2) Handshake Noise XK. Si la pubkey del server no
+            // coincide con `server_pub`, falla aquí (protección MITM).
+            let mut ch = match shuma_link::client_handshake(tcp, &our_keypair, server_pub).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(RunEvent::Failed(format!("handshake: {e}")));
+                    return;
+                }
+            };
+            // 3) Misma forma que el Unix path: enviar la request y
+            // drenar Response frames hasta el terminal o cancel.
+            if let Err(e) = ch.send_postcard(&req).await {
+                let _ = tx.send(RunEvent::Failed(format!("send request: {e}")));
+                return;
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_thread.notified() => {
+                        drop(ch);
+                        return;
+                    }
+                    res = ch.recv_postcard::<Response>() => {
+                        let resp = match res {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = tx.send(RunEvent::Failed(format!("read frame: {e}")));
+                                return;
+                            }
+                        };
+                        let terminal = resp.is_exec_terminal();
+                        if let Some(ev) = response_to_event(resp) {
+                            if tx.send(ev).is_err() {
+                                return;
+                            }
+                        }
+                        if terminal {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    Ok(RemoteRunHandle { rx, finished: false, cancel, pty_out: None })
+}
+
+/// Espejo cifrado (Noise XK sobre TCP) de [`run_pty`] — PTY contra un
+/// daemon **remoto**. Misma forma full-duplex; el asa devuelta acepta
+/// `write_input`/`resize`.
+pub fn run_pty_tcp(
+    spec: &CommandSpec,
+    addr: &str,
+    our_keypair: shuma_link::Keypair,
+    server_pub: shuma_link::PublicKey,
+) -> Result<RemoteRunHandle, RemoteExecError> {
+    let Some((program, args, rows, cols)) = pty_fields(spec) else {
+        return Err(RemoteExecError::PtyNotSupported);
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<RunEvent>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
+    let cancel = Arc::new(Notify::new());
+    let cancel_thread = cancel.clone();
+    let addr_owned = addr.to_string();
+    let req = Request::ExecPty { cwd: spec.cwd.clone(), program, args, rows, cols };
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(RunEvent::Failed(format!("runtime: {e}")));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let tcp = match tokio::net::TcpStream::connect(&addr_owned).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(RunEvent::Failed(format!("connect {addr_owned}: {e}")));
+                    return;
+                }
+            };
+            let ch = match shuma_link::client_handshake(tcp, &our_keypair, server_pub).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(RunEvent::Failed(format!("handshake: {e}")));
+                    return;
+                }
+            };
+            let (mut rd, mut wr) = ch.split();
+            if let Err(e) = wr.send_postcard(&req).await {
+                let _ = tx.send(RunEvent::Failed(format!("send request: {e}")));
+                return;
+            }
+            let writer = tokio::spawn(async move {
+                while let Some(msg) = out_rx.recv().await {
+                    if wr.send_postcard(&msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_thread.notified() => break,
+                    res = rd.recv_postcard::<Response>() => {
+                        let resp = match res {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        };
+                        let terminal = resp.is_exec_terminal();
+                        if let Some(ev) = response_to_event(resp) {
+                            if tx.send(ev).is_err() {
+                                break;
+                            }
+                        }
+                        if terminal {
+                            break;
+                        }
+                    }
+                }
+            }
+            writer.abort();
+        });
+    });
+
+    Ok(RemoteRunHandle { rx, finished: false, cancel, pty_out: Some(out_tx) })
+}
+
+// Re-exports útiles para el shell.
+pub use shuma_exec::{CommandSpec as Spec, Exec as ExecLocal, StageSpec as Stage};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shuma_exec::StageSpec;
+    use shuma_protocol::ExecKind as ProtoExecKind;
+    use std::time::Duration;
+
+    /// Mini servidor que sólo entiende ExecStream — simula al daemon
+    /// pero sin sus dependencias pesadas (cgroups, etc.). Usa el mismo
+    /// puente sync→async que el daemon real.
+    async fn serve_exec_stream(mut stream: tokio::net::UnixStream) {
+        let req: Request = read_frame(&mut stream).await.expect("read request");
+        let Request::ExecStream { cwd, exec, capture_limit_bytes, stdin_data, capture_stages } = req
+        else {
+            panic!("esperaba ExecStream");
+        };
+        let exec_local = match exec {
+            ProtoExecKind::Shell { line, program } => Exec::Shell { line, program },
+            ProtoExecKind::Direct { stages } => Exec::Direct {
+                stages: stages
+                    .into_iter()
+                    .map(|s| StageSpec { program: s.program, args: s.args })
+                    .collect(),
+            },
+        };
+        let spec = CommandSpec {
+            exec: exec_local,
+            cwd,
+            capture_limit: capture_limit_bytes,
+            spill_path: None,
+            stdin_data,
+            capture_stages,
+        };
+        let mut h = shuma_exec::run(&spec);
+        let killer = h.killer();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        std::thread::spawn(move || {
+            while let Some(ev) = h.next_event() {
+                if tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut byte = [0u8; 1];
+        loop {
+            tokio::select! {
+                biased;
+                ev = rx.recv() => {
+                    let Some(ev) = ev else { break };
+                    let terminal = matches!(ev, RunEvent::Exited(_) | RunEvent::Failed(_));
+                    let resp = match ev {
+                        RunEvent::Stdout(l) => Response::ExecStdout(l),
+                        RunEvent::StageStdout { stage, line } => {
+                            Response::ExecStageStdout { stage, line }
+                        }
+                        RunEvent::Stderr(l) => Response::ExecStderr(l),
+                        RunEvent::Truncated => Response::ExecTruncated,
+                        RunEvent::Spilled(p) => Response::ExecSpilled(p),
+                        RunEvent::Exited(c) => Response::ExecExited(c),
+                        RunEvent::Failed(m) => Response::ExecFailed(m),
+                        // Test server no puede levantar PTY (los tests
+                        // usan Exec::Direct), pero el match debe ser
+                        // exhaustivo.
+                        RunEvent::Bytes(_) => continue,
+                    };
+                    if write_frame(&mut stream, &resp).await.is_err() {
+                        killer.kill();
+                        return;
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+                res = tokio::io::AsyncReadExt::read_exact(&mut stream, &mut byte) => {
+                    let _ = res;
+                    killer.kill();
+                    while let Some(ev) = rx.recv().await {
+                        if matches!(ev, RunEvent::Exited(_) | RunEvent::Failed(_)) {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Arranca un mini servidor en `path` que sirve UNA conexión y se
+    /// apaga. Devuelve cuando termina la atención.
+    async fn one_shot_server(path: std::path::PathBuf) {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let (stream, _) = listener.accept().await.expect("accept");
+        serve_exec_stream(stream).await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn temp_socket() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "shuma-remote-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn echo_round_trips_through_remote_client() {
+        let sock = temp_socket();
+        let sock_for_server = sock.clone();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(one_shot_server(sock_for_server));
+        });
+        // Esperamos a que el server bindee.
+        while !sock.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let spec = CommandSpec::direct(
+            vec![StageSpec {
+                program: "echo".into(),
+                args: vec!["hola".into(), "remoto".into()],
+            }],
+            ".",
+        );
+        let mut h = run(&spec, &sock).expect("run remote");
+        let mut got_line = String::new();
+        while let Some(ev) = h.next_event() {
+            if let RunEvent::Stdout(l) = ev {
+                got_line = l;
+            }
+        }
+        server.join().unwrap();
+        assert_eq!(got_line, "hola remoto");
+        assert!(h.is_finished());
+    }
+
+    #[test]
+    fn stage_capture_round_trips_through_remote_client() {
+        // Un pipe de dos etapas con captura activa: el tee de la etapa
+        // intermedia debe sobrevivir el transporte y volver como
+        // `RunEvent::StageStdout`, no perderse ni colapsar a Stdout.
+        let sock = temp_socket();
+        let sock_for_server = sock.clone();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(one_shot_server(sock_for_server));
+        });
+        while !sock.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let spec = CommandSpec::direct(
+            vec![
+                StageSpec { program: "printf".into(), args: vec!["a\\nb\\n".into()] },
+                StageSpec { program: "cat".into(), args: vec![] },
+            ],
+            ".",
+        )
+        .with_stage_capture();
+        let mut h = run(&spec, &sock).expect("run remote");
+        let mut saw_stage = false;
+        while let Some(ev) = h.next_event() {
+            if let RunEvent::StageStdout { stage, line } = ev {
+                if stage == 0 && line == "a" {
+                    saw_stage = true;
+                }
+            }
+        }
+        server.join().unwrap();
+        assert!(saw_stage, "el tee de la etapa intermedia no llegó por el cliente remoto");
+        assert!(h.is_finished());
+    }
+
+    #[test]
+    fn kill_propagates_to_remote_process() {
+        let sock = temp_socket();
+        let sock_for_server = sock.clone();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(one_shot_server(sock_for_server));
+        });
+        while !sock.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let spec = CommandSpec::direct(
+            vec![StageSpec { program: "sleep".into(), args: vec!["30".into()] }],
+            ".",
+        );
+        let mut h = run(&spec, &sock).expect("run remote");
+        // Le damos tiempo a arrancar; luego pedimos kill.
+        std::thread::sleep(Duration::from_millis(150));
+        h.kill();
+        // El stream se cierra, el server mata al hijo, el next_event sale
+        // (puede salir como None si no llega ningún terminal — el server
+        // ya cerró antes de poder enviarlo).
+        let started = std::time::Instant::now();
+        while h.next_event().is_some() {
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("kill no terminó el stream en 5s");
+            }
+        }
+        assert!(h.is_finished());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_error_surfaces_to_caller() {
+        let no_such = std::path::PathBuf::from("/tmp/shuma-no-such-socket.sock");
+        let _ = std::fs::remove_file(&no_such);
+        let spec = CommandSpec::direct(
+            vec![StageSpec { program: "true".into(), args: vec![] }],
+            ".",
+        );
+        match run(&spec, &no_such) {
+            Err(RemoteExecError::Connect(_, _)) => {}
+            Err(e) => panic!("variante de error inesperada: {e:?}"),
+            Ok(_) => panic!("debería fallar al conectar a un socket inexistente"),
+        }
+    }
+
+    // ----- Tests del path TCP autenticado (Noise XK) -----
+
+    /// Espejo de `serve_exec_stream` para FramedChannel — sirve un único
+    /// ExecStream sobre el canal cifrado. Replica la forma del
+    /// `handle_exec_stream_enc` del daemon pero in-process para el test.
+    async fn serve_one_exec_enc(
+        mut ch: shuma_link::FramedChannel<tokio::net::TcpStream>,
+    ) {
+        let req: Request = ch.recv_postcard().await.expect("recv request");
+        let Request::ExecStream { cwd, exec, capture_limit_bytes, stdin_data, capture_stages } = req
+        else {
+            panic!("esperaba ExecStream");
+        };
+        let exec_local = match exec {
+            ProtoExecKind::Shell { line, program } => Exec::Shell { line, program },
+            ProtoExecKind::Direct { stages } => Exec::Direct {
+                stages: stages
+                    .into_iter()
+                    .map(|s| StageSpec { program: s.program, args: s.args })
+                    .collect(),
+            },
+        };
+        let spec = CommandSpec {
+            exec: exec_local,
+            cwd,
+            capture_limit: capture_limit_bytes,
+            spill_path: None,
+            stdin_data,
+            capture_stages,
+        };
+        let mut h = shuma_exec::run(&spec);
+        let killer = h.killer();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        std::thread::spawn(move || {
+            while let Some(ev) = h.next_event() {
+                if tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        });
+        while let Some(ev) = rx.recv().await {
+            let terminal = matches!(ev, RunEvent::Exited(_) | RunEvent::Failed(_));
+            let resp = match ev {
+                RunEvent::Stdout(l) => Response::ExecStdout(l),
+                RunEvent::StageStdout { stage, line } => {
+                    Response::ExecStageStdout { stage, line }
+                }
+                RunEvent::Stderr(l) => Response::ExecStderr(l),
+                RunEvent::Truncated => Response::ExecTruncated,
+                RunEvent::Spilled(p) => Response::ExecSpilled(p),
+                RunEvent::Exited(c) => Response::ExecExited(c),
+                RunEvent::Failed(m) => Response::ExecFailed(m),
+                RunEvent::Bytes(_) => continue, // Test server no usa PTY
+            };
+            if ch.send_postcard(&resp).await.is_err() {
+                killer.kill();
+                return;
+            }
+            if terminal {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn echo_round_trips_through_encrypted_tcp_client() {
+        // Bind a localhost con puerto efímero para evitar choque.
+        let server_kp = shuma_link::Keypair::generate().unwrap();
+        let client_kp = shuma_link::Keypair::generate().unwrap();
+        let server_pub = server_kp.public();
+
+        // Server-thread con su propio runtime para no contender el del
+        // cliente (que vive dentro del hilo de `run_tcp`).
+        let server_kp2 = server_kp.clone();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap().to_string();
+                addr_tx.send(addr).unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (ch, _peer) = shuma_link::server_handshake(tcp, &server_kp2).await.unwrap();
+                serve_one_exec_enc(ch).await;
+            });
+        });
+        let addr = addr_rx.recv().unwrap();
+        let spec = CommandSpec::direct(
+            vec![StageSpec { program: "echo".into(), args: vec!["hola".into(), "cifrado".into()] }],
+            ".",
+        );
+        let mut h = run_tcp(&spec, &addr, client_kp, server_pub).unwrap();
+        let mut got = String::new();
+        while let Some(ev) = h.next_event() {
+            if let RunEvent::Stdout(l) = ev {
+                got = l;
+            }
+        }
+        server_thread.join().unwrap();
+        assert_eq!(got, "hola cifrado");
+        assert!(h.is_finished());
+    }
+
+    #[test]
+    fn wrong_server_pubkey_surfaces_as_failed_event() {
+        // El cliente espera la pubkey de un server "legítimo", pero el
+        // que responde es otro. El handshake debe fallar y eso llega al
+        // shell como un RunEvent::Failed, NO como un panic.
+        let real_server = shuma_link::Keypair::generate().unwrap();
+        let attacker = shuma_link::Keypair::generate().unwrap();
+        let client = shuma_link::Keypair::generate().unwrap();
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap().to_string()).unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
+                // El "atacante" se identifica con su propia keypair.
+                let _ = shuma_link::server_handshake(tcp, &attacker).await;
+            });
+        });
+        let addr = addr_rx.recv().unwrap();
+        let spec = CommandSpec::direct(
+            vec![StageSpec { program: "true".into(), args: vec![] }],
+            ".",
+        );
+        let mut h = run_tcp(&spec, &addr, client, real_server.public()).unwrap();
+        let mut saw_failed = false;
+        while let Some(ev) = h.next_event() {
+            if matches!(ev, RunEvent::Failed(_)) {
+                saw_failed = true;
+            }
+        }
+        server_thread.join().ok();
+        assert!(saw_failed, "se esperaba RunEvent::Failed por pubkey errónea");
+    }
+
+    // ----- Tests del PTY remoto (full-duplex) -----
+
+    /// Spec PTY de conveniencia para los tests.
+    fn pty_spec(program: &str, args: &[&str]) -> CommandSpec {
+        CommandSpec {
+            exec: Exec::Pty {
+                program: program.into(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                rows: 24,
+                cols: 80,
+            },
+            cwd: ".".into(),
+            capture_limit: 0,
+            spill_path: None,
+            stdin_data: None,
+            capture_stages: false,
+        }
+    }
+
+    /// Mini servidor PTY in-process — replica `handle_pty_stream` del daemon
+    /// (texto plano) sin sus dependencias pesadas.
+    async fn serve_one_pty(mut stream: tokio::net::UnixStream) {
+        let req: Request = read_frame(&mut stream).await.expect("read req");
+        let Request::ExecPty { cwd, program, args, rows, cols } = req else {
+            panic!("esperaba ExecPty");
+        };
+        let spec = CommandSpec {
+            exec: Exec::Pty { program, args, cols, rows },
+            cwd,
+            capture_limit: 0,
+            spill_path: None,
+            stdin_data: None,
+            capture_stages: false,
+        };
+        let mut h = shuma_exec::run(&spec);
+        let killer = h.killer();
+        let pty = h.pty_control();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        std::thread::spawn(move || {
+            while let Some(ev) = h.next_event() {
+                if tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        });
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let reader = tokio::spawn(async move {
+            loop {
+                match read_frame::<Request, _>(&mut rd).await {
+                    Ok(Request::PtyInput { bytes }) => {
+                        pty.write_input(bytes);
+                    }
+                    Ok(Request::PtyResize { rows, cols }) => {
+                        pty.resize(rows, cols);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        killer.kill();
+                        break;
+                    }
+                }
+            }
+        });
+        while let Some(ev) = rx.recv().await {
+            let terminal = matches!(ev, RunEvent::Exited(_) | RunEvent::Failed(_));
+            let resp = match ev {
+                RunEvent::Bytes(b) => Response::ExecBytes(b),
+                RunEvent::Exited(c) => Response::ExecExited(c),
+                RunEvent::Failed(m) => Response::ExecFailed(m),
+                _ => continue,
+            };
+            if write_frame(&mut wr, &resp).await.is_err() {
+                break;
+            }
+            if terminal {
+                break;
+            }
+        }
+        reader.abort();
+    }
+
+    async fn one_shot_pty_server(path: std::path::PathBuf) {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let (stream, _) = listener.accept().await.expect("accept");
+        serve_one_pty(stream).await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pty_streams_output_and_exits() {
+        // Un PTY que imprime y termina: los bytes deben llegar como
+        // `RunEvent::Bytes` y cerrar con `Exited`.
+        let sock = temp_socket();
+        let sock_for_server = sock.clone();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(one_shot_pty_server(sock_for_server));
+        });
+        while !sock.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut h = run_pty(&pty_spec("printf", &["pty-ok\\n"]), &sock).expect("run_pty");
+        let mut got = Vec::new();
+        let mut exited = false;
+        while let Some(ev) = h.next_event() {
+            match ev {
+                RunEvent::Bytes(b) => got.extend_from_slice(&b),
+                RunEvent::Exited(_) => exited = true,
+                _ => {}
+            }
+        }
+        server.join().unwrap();
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("pty-ok"), "no llegó la salida del PTY: {text:?}");
+        assert!(exited, "no llegó el evento Exited");
+        assert!(h.is_finished());
+    }
+
+    #[test]
+    fn pty_forwards_input_to_remote() {
+        // `cat` bajo PTY: la línea tipeada se devuelve (eco de la línea
+        // de disciplina del terminal). Comprueba el camino cliente→daemon
+        // (`write_input` → `PtyInput`).
+        let sock = temp_socket();
+        let sock_for_server = sock.clone();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(one_shot_pty_server(sock_for_server));
+        });
+        while !sock.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut h = run_pty(&pty_spec("cat", &[]), &sock).expect("run_pty");
+        std::thread::sleep(Duration::from_millis(150)); // que arranque cat
+        assert!(h.write_input(b"ping\n".to_vec()), "write_input debería encolar");
+        let mut got = String::new();
+        let start = std::time::Instant::now();
+        loop {
+            for ev in h.try_events() {
+                if let RunEvent::Bytes(b) = ev {
+                    got.push_str(&String::from_utf8_lossy(&b));
+                }
+            }
+            if got.contains("ping") || start.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        h.kill();
+        server.join().unwrap();
+        assert!(got.contains("ping"), "el PTY remoto no devolvió el eco del input: {got:?}");
+    }
+
+    /// Mini servidor PTY cifrado — replica `handle_pty_stream_enc` con
+    /// `FramedChannel::split`.
+    async fn serve_one_pty_enc(ch: shuma_link::FramedChannel<tokio::net::TcpStream>) {
+        let (mut rd, mut wr) = ch.split();
+        let req: Request = rd.recv_postcard().await.expect("recv req");
+        let Request::ExecPty { cwd, program, args, rows, cols } = req else {
+            panic!("esperaba ExecPty");
+        };
+        let spec = CommandSpec {
+            exec: Exec::Pty { program, args, cols, rows },
+            cwd,
+            capture_limit: 0,
+            spill_path: None,
+            stdin_data: None,
+            capture_stages: false,
+        };
+        let mut h = shuma_exec::run(&spec);
+        let killer = h.killer();
+        let pty = h.pty_control();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        std::thread::spawn(move || {
+            while let Some(ev) = h.next_event() {
+                if tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        });
+        let reader = tokio::spawn(async move {
+            loop {
+                match rd.recv_postcard::<Request>().await {
+                    Ok(Request::PtyInput { bytes }) => {
+                        pty.write_input(bytes);
+                    }
+                    Ok(Request::PtyResize { rows, cols }) => {
+                        pty.resize(rows, cols);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        killer.kill();
+                        break;
+                    }
+                }
+            }
+        });
+        while let Some(ev) = rx.recv().await {
+            let terminal = matches!(ev, RunEvent::Exited(_) | RunEvent::Failed(_));
+            let resp = match ev {
+                RunEvent::Bytes(b) => Response::ExecBytes(b),
+                RunEvent::Exited(c) => Response::ExecExited(c),
+                RunEvent::Failed(m) => Response::ExecFailed(m),
+                _ => continue,
+            };
+            if wr.send_postcard(&resp).await.is_err() {
+                break;
+            }
+            if terminal {
+                break;
+            }
+        }
+        reader.abort();
+    }
+
+    #[test]
+    fn pty_round_trips_over_encrypted_tcp() {
+        // Mismo flujo PTY pero sobre Noise XK: valida `FramedChannel::split`
+        // y `run_pty_tcp` end-to-end.
+        let server_kp = shuma_link::Keypair::generate().unwrap();
+        let client_kp = shuma_link::Keypair::generate().unwrap();
+        let server_pub = server_kp.public();
+        let server_kp2 = server_kp.clone();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
+        let server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap().to_string()).unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (ch, _peer) = shuma_link::server_handshake(tcp, &server_kp2).await.unwrap();
+                serve_one_pty_enc(ch).await;
+            });
+        });
+        let addr = addr_rx.recv().unwrap();
+        let mut h = run_pty_tcp(&pty_spec("printf", &["pty-cifrado\\n"]), &addr, client_kp, server_pub)
+            .expect("run_pty_tcp");
+        let mut got = Vec::new();
+        let mut exited = false;
+        while let Some(ev) = h.next_event() {
+            match ev {
+                RunEvent::Bytes(b) => got.extend_from_slice(&b),
+                RunEvent::Exited(_) => exited = true,
+                _ => {}
+            }
+        }
+        server_thread.join().unwrap();
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("pty-cifrado"), "no llegó la salida del PTY cifrado: {text:?}");
+        assert!(exited);
+        assert!(h.is_finished());
+    }
+}
